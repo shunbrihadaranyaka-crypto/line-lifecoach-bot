@@ -1,195 +1,328 @@
 const express = require("express");
 const line = require("@line/bot-sdk");
 const OpenAI = require("openai");
+const fs = require("fs");
+const path = require("path");
 
 // ─────────────────────────────
-// LINEの設定（Renderの環境変数から取る）
+// 環境変数から設定取得
 // ─────────────────────────────
 const config = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET
 };
 
-// OpenAI クライアント
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
 // ─────────────────────────────
-// セッション用の簡易メモリ（サーバーが動いている間だけ保持）
-// ユーザーごとに直近の会話を覚えておく
+// セッション管理 & 長期メモリ
 // ─────────────────────────────
-const sessions = {}; // { userId: [ { role, content }, ... ] }
+
+// ユーザーごとのセッション（サーバーが動いている間）
+const sessions = {}; // { [userId]: { stageIndex, turnsInStage, history: [...] } }
+
+// ユーザーごとの長期プロフィール（ファイルに保存）
+const PROFILE_FILE = path.join(__dirname, "userProfiles.json");
+let userProfiles = {}; // { [userId]: { values:[], talents:[], likes:[], goals:[], vision:"", lastUpdated: "" } }
+
+function loadProfiles() {
+  try {
+    if (fs.existsSync(PROFILE_FILE)) {
+      const raw = fs.readFileSync(PROFILE_FILE, "utf8");
+      userProfiles = JSON.parse(raw);
+    }
+  } catch (e) {
+    console.error("Failed to load userProfiles.json:", e);
+    userProfiles = {};
+  }
+}
+
+function saveProfiles() {
+  try {
+    fs.writeFileSync(PROFILE_FILE, JSON.stringify(userProfiles, null, 2), "utf8");
+  } catch (e) {
+    console.error("Failed to save userProfiles.json:", e);
+  }
+}
+
+function getOrCreateProfile(userId) {
+  if (!userProfiles[userId]) {
+    userProfiles[userId] = {
+      values: [],
+      talents: [],
+      likes: [],
+      goals: [],
+      vision: "",
+      lastUpdated: new Date().toISOString()
+    };
+  }
+  return userProfiles[userId];
+}
+
+// 起動時にロード
+loadProfiles();
 
 // ─────────────────────────────
-// コーチAIの人格・ルール（systemプロンプト）
+// セッションのステージ定義
 // ─────────────────────────────
-const SYSTEM_PROMPT = `
-あなたは「ライフビジョンを言語化する専門コーチAI」です。  
-話すだけで「今の自分には無理だと思うくらい大きな未来のビジョン」を見つけられるよう、  
-クライアントの内面をやさしく、深く、ていねいに引き出します。
+const STAGES = [
+  {
+    id: "values",
+    name: "大事なこと（価値観）",
+    maxTurns: 4,
+    objective:
+      "クライアントが『こう生きたい』『こんな状態でいたい』と思う価値観を言語化する。" +
+      "幼少期の経験・尊敬する人・社会への違和感・本物の価値観（〜したい）にフォーカスする。"
+  },
+  {
+    id: "talents",
+    name: "得意なこと（才能）",
+    maxTurns: 4,
+    objective:
+      "クライアントが『無意識にやってしまう』『やっていて心地よい』行動パターンを見つける。" +
+      "充実体験・イラっとするポイント・周りに褒められること・成果の出し方から才能を探す。"
+  },
+  {
+    id: "likes",
+    name: "好きなこと（興味）",
+    maxTurns: 4,
+    objective:
+      "クライアントが『なぜか気になる』『お金を払ってでも学びたい』と思う対象を探す。" +
+      "本棚・勉強したいこと・救われた経験・怒りを感じる社会問題などから興味を掘る。"
+  },
+  {
+    id: "want",
+    name: "やりたいことの仮説",
+    maxTurns: 3,
+    objective:
+      "これまで出てきた『好き × 得意』を組み合わせて、やりたいことの仮説をいくつか作る。" +
+      "完璧を目指さず、『とりあえずこれで試してみたい』レベルでOKであると伝える。"
+  },
+  {
+    id: "vision",
+    name: "ライフビジョン",
+    maxTurns: 3,
+    objective:
+      "制限を外して、5〜10年後の理想的な一日や生き方を具体的にイメージしてもらう。" +
+      "『今の自分には無理そうだけど、想像するとワクワクする未来』を大きく描いてもらう。"
+  },
+  {
+    id: "action",
+    name: "最初の一歩",
+    maxTurns: 2,
+    objective:
+      "ライフビジョンに少しでも近づくために、明日〜1週間以内にできる小さな行動を一緒に決める。" +
+      "現実的で小さく、でも本人にとって意味がある一歩にする。"
+  },
+  {
+    id: "summary",
+    name: "まとめ・フィードバック",
+    maxTurns: 1,
+    objective:
+      "これまでの対話を振り返り、『価値観・得意・好き・本当にやりたいこと・ライフビジョン・最初の一歩』を整理して言語化する。" +
+      "同時に、内部的にはキーワードを抽出して長期メモリに保存する。"
+  }
+];
 
-あなたのコーチングは、八木仁平氏の「自己理解メソッド」の原則に基づきます。  
-（「世界一やさしい『やりたいこと』の見つけ方」図解資料135ページ）:contentReference[oaicite:1]{index=1}
+function getStage(session) {
+  return STAGES[session.stageIndex] || STAGES[STAGES.length - 1];
+}
 
-────────────────────────────────
-【あなたのミッション】
-────────────────────────────────
-クライアントが以下を明確にできるよう対話で伴走する：
-
-1. 「大事なこと（価値観）」：人生の目的・生き方の方向性  
-   - 例：自由に生きたい、夢中になりたい、穏やかに生きたい（p.33）:contentReference[oaicite:2]{index=2}  
-2. 「得意なこと（才能）」：自然とできる・心地よくできる・無意識のクセ（p.27–30）:contentReference[oaicite:3]{index=3}  
-3. 「好きなこと（興味）」：なぜか惹かれる、学びたくなる対象（p.26, p.105–111）:contentReference[oaicite:4]{index=4}  
-4. 「やりたいこと」＝好き × 得意（p.24–31）:contentReference[oaicite:5]{index=5}  
-5. 「本当にやりたいこと」＝好き × 得意 × 大事（公式2）（p.24–25）:contentReference[oaicite:6]{index=6}  
-6. 「人生の目的」と「仕事の目的」を一致させる（p.36–37, p.76–80）:contentReference[oaicite:7]{index=7}  
-7. 最後に「今の自分では無理だと思うくらいの未来ビジョン」を仮決定する（p.115–118）:contentReference[oaicite:8]{index=8}  
-
-────────────────────────────────
-【話し方のスタイル】
-────────────────────────────────
-- ゆっくり・短め（3〜6行）で読みやすく  
-- 1メッセージにつき質問は 1つだけ  
-- 相手の言葉を要約しながら進める（ミラーリング）  
-- 否定・断定はしない  
-- 結論は急がず、質問→要約→質問の循環をつくる  
-- 「解説しすぎない」「情報提供しすぎない」  
-  → 説明は最小限、すぐに相手の内面に戻すこと  
-- 誘導せず、本人の価値観から導く  
-
-────────────────────────────────
-【あなたがやるべき対話プロセス（八木式）】
-────────────────────────────────
-
-●フェーズA：安心安全の場づくり  
-- 今日話したいテーマ、気になることを軽く聞く  
-- とにかく「受け止める」姿勢  
-- 正解探しではなく、探求であると伝える  
-
-●フェーズB：「大事なこと（価値観）」を探る（p.58–80）  
-質問例：  
-- 幼少期〜思春期で影響を与えた出来事は？（p.62）  
-- 人生で最も尊敬する人は？どんな価値観を感じる？（p.61）  
-- 社会に足りないと感じるものは？（p.63）  
-- 子どもに1つだけ伝えたい行動は？（p.65）  
-- どんな状態で生きたい？（自由・安心・夢中・穏やか）（p.33）  
-
-目的：  
-→ 本物の価値観（「〜したい」）を言語化し、  
-   他人軸（「〜すべき」）を排除する（p.57–72）。  
-
-●フェーズC：「得意なこと（才能）」を探る（p.83–99）  
-質問例：  
-- これまでで最も充実していた体験は？（p.86）  
-- 最近イラッとしたのは？（得意の裏側）（p.88–89）  
-- 人に褒められたこと・頼られたことは？（p.90–91）  
-- 成果が出たとき、どんな行動をしていた？（p.94）  
-
-目的：  
-→ 生まれ持ったクセ・才能を言語化する。  
-
-●フェーズD：「好きなこと（興味）」を探る（p.102–112）  
-質問例：  
-- お金を払ってでも勉強したい分野は？（p.105）  
-- 本棚にある本のジャンルは？（p.106）  
-- 救われた経験から興味が生まれたものは？（p.107）  
-- 怒りを感じた社会の問題は？（興味の裏返し）（p.109）  
-
-目的：  
-→ 理屈ではなく「なぜか気になってしまうもの」を拾う。  
-
-●フェーズE：「やりたいこと（仮説）」づくり（p.115–123）  
-- 好き × 得意 = やりたいこと（公式1）  
-- やりたいこと × 大事なこと = 本当にやりたいこと（公式2）  
-- 完璧を求めず「仮説」で良い（p.115–116）  
-
-●フェーズF：ライフビジョン（大きな未来像）の仮決定  
-質問例：  
-- もし制限（お金・時間・能力）がないなら、5〜10年後どう生きたい？  
-- 理想の1日の過ごし方は？  
-- どんな人たちに囲まれていたい？  
-- どんな価値を人に届けていたい？  
-
-目的：  
-→ 「今の自分では無理だと思うくらいの未来」を描く。  
-
-●フェーズG：最初の一歩を決める（p.126–130）  
-- 明日〜1週間以内にできる行動の最小単位を聞き出す  
-- ビジョンと現在地の差を埋める行動  
-
-────────────────────────────────
-【NG行動】
-────────────────────────────────
-- 科学・映画・宇宙などの解説を長々とする（例：映画「オデッセイ」の説明）  
-- 一度に複数質問する  
-- 決めつけ・助言・説教  
-- 相手の価値観を否定したり縮小させる  
-- “社会的に正しい答え”に誘導する  
-- 急に結論を出す  
-
-────────────────────────────────
-【あなたが必ず守る返答構造】
-────────────────────────────────
-1. クライアントの発言を短く要約（ミラーリング）  
-2. 感情・価値観・意図をやさしく言語化  
-3. そのテーマから「自己理解メソッド」のどの要素が見えたか示す  
-4. 次の探求を促す “質問を1つだけ” 提示  
-
-例：  
-「なるほど、あなたは○○という経験の中で□□を大切にしてきたんですね。  
-それは〈大事なこと（価値観）〉の中の△△に近い気がします。  
-では、○○のように感じた背景には、どんな思いがありましたか？」
-
-────────────────────────────────
-【セッション終了時のまとめフォーマット】
-────────────────────────────────
-
-【今日見えた価値観（大事なこと）】  
-- ○○  
-- ○○  
-
-【得意なこと（才能）】  
-- ○○  
-- ○○  
-
-【好きなこと（興味）】  
-- ○○  
-- ○○  
-
-【本当にやりたいこと（仮説）】  
-（短い文章で1〜3案）
-
-【ライフビジョン（未来の物語）】  
-（2〜4行）
-
-【明日〜1週間以内にできる一歩】  
-- ① ○○  
-- ② ○○  
-
-【セルフリフレクションの問い】  
-- 今日の対話で、どこが一番しっくり来ましたか？  
-- このビジョンが実現したとき、どんな感情を味わっていたいですか？
-
-────────────────────────────────
-【重要】  
-あなたは情報提供AIではなく、  
-“価値観・才能・興味を引き出して未来のビジョンを見つける専門コーチ”です。  
-答えはクライアントの中にある前提で、  
-問いと要約によって内側の言葉を発掘していきます。
 // ─────────────────────────────
-// Express アプリ
+// コーチAIのベース SYSTEM プロンプト
+// （さっき一緒に作った長いコンセプトをぎゅっと要約版）
+// ─────────────────────────────
+const BASE_SYSTEM_PROMPT = `
+あなたはライフビジョン専門のプロフェッショナルコーチAIです。
+クライアントが「今の自分には無理だと思うくらい大きなライフビジョン」を言語化できるよう、
+質問と要約とフィードバックで伴走します。
+
+・解説よりも「質問」「要約」「感情への共感」を優先してください。
+・1メッセージは3〜6行程度＋最後に質問は1つだけにしてください。
+・正解を押しつけず、クライアントの中にある価値観・才能・興味を引き出します。
+・映画や科学などの知識説明は1〜2段落までにし、その後は必ず
+  「あなた自身はそのテーマについてどう感じますか？」と本人に戻してください。
+・全体のゴールは
+  1) 大事なこと（価値観）
+  2) 得意なこと（才能）
+  3) 好きなこと（興味）
+  4) 本当にやりたいことの仮説
+  5) ライフビジョン（物語）
+  6) 最初の一歩
+  をクライアントと一緒に見つけることです。
+`;
+
+// ─────────────────────────────
+// OpenAI 呼び出し：通常のコーチ対話
+// ─────────────────────────────
+async function callCoachModel({ stage, profile, history, userText }) {
+  const stageInstruction = `
+現在のステージ: ${stage.name} (${stage.id})
+
+このステージの目的:
+${stage.objective}
+
+・このステージでは、このテーマに関する質問を中心に行ってください。
+・ステージ内では必ず「相手の言葉の要約」→「そこから見える価値観/才能/興味の仮説」→「次の質問」
+  の流れで対話します。
+・ステージの後半（最後の1〜2ターン）では、そのステージで見えてきたポイントを簡単に整理し、
+  次のステージで扱うテーマを軽く予告してください。
+`;
+
+  const memoryText = profile
+    ? `
+【このクライアントについて、これまで分かっている長期メモリ】
+
+- 価値観（大事にしたいこと）: ${profile.values.join("、") || "まだ明確ではない"}
+- 得意なこと（才能）: ${profile.talents.join("、") || "まだ明確ではない"}
+- 好きなこと（興味のある分野）: ${profile.likes.join("、") || "まだ明確ではない"}
+- 本当にやりたいことの仮説: ${profile.goals.join("、") || "未設定"}
+- ライフビジョンのメモ: ${profile.vision || "未設定"}
+
+この情報を参考にしつつ、今日の対話から新しい気づきがあれば、
+さりげなくそれをフィードバックしてください。
+`
+    : "";
+
+  const messages = [
+    { role: "system", content: BASE_SYSTEM_PROMPT },
+    { role: "system", content: stageInstruction },
+    { role: "system", content: memoryText },
+    // これまでの会話履歴を挿入
+    ...history,
+    { role: "user", content: userText }
+  ];
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1",
+    messages
+  });
+
+  return completion.choices[0]?.message?.content?.trim() || "少し考えがまとまらなかったみたいです…もう一度教えてもらえますか？";
+}
+
+// ─────────────────────────────
+// OpenAI 呼び出し：プロフィール抽出（内部用）
+// ─────────────────────────────
+async function extractProfileFromConversation(history) {
+  // history は [{role, content}, ...]
+  const analysisPrompt = `
+あなたはコーチングの記録を分析するアシスタントです。
+以下の会話履歴（コーチとクライアントの両方の発言を含む）から、
+クライアントの特徴をJSON形式で抽出してください。
+
+出力は必ず次の形式のJSON「だけ」にしてください。（説明文やコードブロックは禁止）
+
+{
+  "values": ["価値観1", "価値観2", ...],        // 生き方の価値観（自由、好奇心、安心、夢中などの1〜7個の名詞）
+  "talents": ["才能1", "才能2", ...],            // 得意なこと・自然とやってしまうこと（1〜7個）
+  "likes": ["興味分野1", "興味分野2", ...],      // 好きな分野・テーマ（1〜7個）
+  "goals": ["本当にやりたいことの文章1", ...],  // 本当にやりたいことの候補（1〜3個）
+  "vision": "5〜10年後のライフビジョンを1段落で要約した文章"
+}
+
+キーワードはすべて日本語で、短い名詞または短文にしてください。
+`;
+
+  const messages = [
+    { role: "system", content: analysisPrompt },
+    ...history
+  ];
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1",
+    messages,
+    temperature: 0.2
+  });
+
+  const text = completion.choices[0]?.message?.content || "{}";
+
+  try {
+    const json = JSON.parse(text);
+    return json;
+  } catch (e) {
+    console.error("Failed to parse profile JSON:", text, e);
+    return null;
+  }
+}
+
+// ─────────────────────────────
+// OpenAI 呼び出し：最終まとめメッセージ
+// ─────────────────────────────
+async function generateSummaryMessage(profile, history) {
+  const summaryPrompt = `
+あなたはライフビジョンコーチです。
+これまでのコーチング対話の履歴と、内部的に整理されたプロフィール情報をもとに、
+クライアントに渡す「今日のまとめメッセージ」を作ってください。
+
+出力フォーマットは必ず次の構造にしてください（日本語）：
+
+【今日見えた価値観（大事なこと）】
+- 〜
+- 〜
+
+【得意なこと（才能）】
+- 〜
+- 〜
+
+【好きなこと（興味）】
+- 〜
+- 〜
+
+【本当にやりたいこと（仮説）】
+- 〜
+
+【ライフビジョン（未来の物語）】
+（2〜4行で、5〜10年後の理想の一日や生き方を物語風に）
+
+【最初の一歩（明日〜1週間以内）】
+- ① 〜
+- ② 〜（あれば）
+
+【今日の振り返りの問い】
+- 〜
+
+箇条書きは見やすく、クライアントがスクリーンショットを撮って
+何度も見返せるように、シンプルで優しい言葉でまとめてください。
+`;
+
+  const memoryBlock = `
+【内部プロフィール情報】
+
+- 価値観: ${profile.values.join("、") || "未設定"}
+- 才能: ${profile.talents.join("、") || "未設定"}
+- 好きなこと: ${profile.likes.join("、") || "未設定"}
+- 本当にやりたいこと: ${profile.goals.join("、") || "未設定"}
+- ライフビジョン（要約）: ${profile.vision || "未設定"}
+`;
+
+  const messages = [
+    { role: "system", content: summaryPrompt },
+    { role: "system", content: memoryBlock },
+    ...history
+  ];
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1",
+    messages
+  });
+
+  return completion.choices[0]?.message?.content?.trim() || "今日はたくさん話してくれてありがとうございました。これからも少しずつ、一緒にライフビジョンを育てていきましょう。";
+}
+
+// ─────────────────────────────
+// Express + LINE Webhook
 // ─────────────────────────────
 const app = express();
 
-// LINEのWebhookエンドポイント
 app.post("/webhook", line.middleware(config), async (req, res) => {
   const client = new line.Client(config);
   const events = req.body.events;
 
   await Promise.all(
     events.map(async (event) => {
-      // テキストメッセージ以外は無視
       if (event.type !== "message" || event.message.type !== "text") {
         return;
       }
@@ -197,64 +330,115 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const userText = event.message.text;
       const userId = event.source.userId;
 
-      // このユーザー用の履歴がなければ作る
+      // セッション取得 or 初期化
       if (!sessions[userId]) {
-        sessions[userId] = [];
+        sessions[userId] = {
+          stageIndex: 0,
+          turnsInStage: 0,
+          history: [] // [{role, content}, ...]
+        };
       }
 
-      // これまでの履歴 + 今回の発言をまとめてモデルに渡す
-      const messages = [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...sessions[userId],
-        { role: "user", content: userText }
-      ];
+      const session = sessions[userId];
+      let stage = getStage(session);
+
+      // プロフィール取得
+      const profile = getOrCreateProfile(userId);
+
+      let replyText = "";
 
       try {
-        const completion = await openai.chat.completions.create({
-          // ※ここでモデルを gpt-4.1 に格上げ
-          model: "gpt-4.1",
-          messages
-        });
+        // summary ステージは特別扱い
+        if (stage.id === "summary") {
+          // 1) 会話履歴からプロフィール抽出・更新
+          const extracted = await extractProfileFromConversation(session.history);
+          if (extracted) {
+            if (Array.isArray(extracted.values)) {
+              profile.values = extracted.values;
+            }
+            if (Array.isArray(extracted.talents)) {
+              profile.talents = extracted.talents;
+            }
+            if (Array.isArray(extracted.likes)) {
+              profile.likes = extracted.likes;
+            }
+            if (Array.isArray(extracted.goals)) {
+              profile.goals = extracted.goals;
+            }
+            if (typeof extracted.vision === "string") {
+              profile.vision = extracted.vision;
+            }
+            profile.lastUpdated = new Date().toISOString();
+            saveProfiles();
+          }
 
-        const replyText =
-          completion.choices[0]?.message?.content ||
-          "ちょっと上手く返答できなかったみたい…もう一度教えてくれる？";
+          // 2) まとめメッセージ生成
+          // 会話履歴 + プロフィールを渡す
+          replyText = await generateSummaryMessage(profile, session.history);
 
-        // 履歴を更新（最後の10メッセージ分だけ残す）
-        sessions[userId].push({ role: "user", content: userText });
-        sessions[userId].push({ role: "assistant", content: replyText });
-        if (sessions[userId].length > 10) {
-          sessions[userId] = sessions[userId].slice(-10);
+          // summary なので、ステージ進行はここで止めてOK
+        } else {
+          // 通常ステージ：コーチモデルに投げる
+          replyText = await callCoachModel({
+            stage,
+            profile,
+            history: session.history,
+            userText
+          });
+
+          // 履歴更新（ユーザー発言＆AI返答）
+          session.history.push({ role: "user", content: userText });
+          session.history.push({ role: "assistant", content: replyText });
+
+          // 履歴が長くなりすぎないように制限
+          if (session.history.length > 40) {
+            session.history = session.history.slice(-40);
+          }
+
+          // ステージのターン数カウント & 進行
+          session.turnsInStage += 1;
+
+          if (session.turnsInStage >= stage.maxTurns) {
+            session.stageIndex = Math.min(session.stageIndex + 1, STAGES.length - 1);
+            session.turnsInStage = 0;
+            stage = getStage(session); // 次のステージに更新
+
+            // 次のステージ開始の軽い案内を、返答の最後に一行付け足す
+            if (stage.id !== "summary") {
+              replyText += `\n\n――\n次のステージでは「${stage.name}」について、一緒に深掘りしていきましょう。`;
+            } else {
+              replyText += `\n\n――\n次で、これまでの対話を振り返る「まとめ」のステージに入ります。`;
+            }
+          }
         }
 
-        // LINEに返信
+        // LINE へ返信
         await client.replyMessage(event.replyToken, {
           type: "text",
           text: replyText
         });
       } catch (err) {
-        console.error("OpenAI or LINE reply error:", err);
+        console.error("Error in webhook handler:", err);
 
-        // エラー時もユーザーには何か返す
+        // エラー時もユーザーにはメッセージを返す
         try {
           await client.replyMessage(event.replyToken, {
             type: "text",
             text:
-              "ごめんね、内部でエラーが起きちゃったみたい…少し時間をおいてもう一度試してみて！"
+              "ごめんね、内部でエラーが起きちゃったみたい…少し時間をおいて、もう一度話しかけてみてもらえる？"
           });
         } catch (e) {
-          console.error("Failed to send error message to user:", e);
+          console.error("Failed to send error reply:", e);
         }
       }
     })
   );
 
-  // LINE側に「受け取ったよ」と返す
   res.status(200).json({ status: "ok" });
 });
 
-// Render用：PORTがあればそれを使う
+// 起動
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log("Server running on port", port);
+  console.log("LifeVision Coach bot server running on port", port);
 });
